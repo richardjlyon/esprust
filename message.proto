@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package kwsensor;
+
+message Meta {
+   string device_id = 1;
+   string firmware = 2;
+}
+
+enum SensorName {
+    UnknownSensor = 0;
+    HDC1080 = 1;
+    SCD30 = 2;
+    VEML7700 = 3;
+    BMP388 = 4;
+    LORA = 5;
+    BATTERY = 6;
+    EMONPI = 7;
+    BOILERLIGHT = 8;
+    DHT22 = 9;
+    SHT15 = 10;
+    SHT31 = 11;
+    VIRTUAL = 20;
+}
+
+message SensorField {
+    SensorName sensor_name = 1;
+    oneof type {
+        // Environment
+        float temperature = 3;
+        float humidity = 4;
+        float pressure = 5;
+        float co2 = 6;
+        float light = 7;
+        float dewpoint = 40;
+
+        // Energy
+        float power = 8;
+        bool boiler_state = 9;
+        int32 boiler_on_time = 10;
+        float voltage = 20;
+        
+        // LORA
+        float rssi = 30;
+        float frequency_error = 31;
+        float snr = 32;
+   }
+}
+
+message Packet {
+   int32 packet_id = 1;
+   Meta meta = 2;
+   repeated SensorField sensorFields = 4;
+} 
