@@ -7,7 +7,9 @@
 #![no_main]
 #![feature(type_alias_impl_trait)]
 
-use core::time::Duration;
+mod ref_cell_i2c;
+
+use core::cell::RefCell;
 
 use bytes::BytesMut;
 use embassy_executor::Executor;
@@ -17,6 +19,7 @@ use embassy_sync::{
     signal::Signal,
 };
 use embassy_time::{Duration, Timer, Ticker};
+use embedded_hdc1080_rs::Hdc1080;
 use esp32c3_hal::{
     clock::ClockControl,
     embassy,
@@ -34,8 +37,14 @@ use prost::{
     Message,
 };
 use proto::{sensor_field::Type, Packet, SensorField};
+use scd4x::scd4x::Scd4x;
 use sht3x::{Repeatability, SHT3x};
 use static_cell::StaticCell;
+use veml7700::Veml7700;
+use futures_util::StreamExt;
+
+use crate::ref_cell_i2c::RefCellBus;
+
 
 mod proto {
     use core::sync::atomic::AtomicI32;
@@ -59,11 +68,11 @@ mod proto {
 }
 
 #[embassy_executor::task]
-async fn read_sensors(
-    mut sensor: SHT3x<I2C<'static, I2C0>, Delay>,
+async fn read_sht3x(
+    mut sensor: SHT3x<&'static RefCellBus<I2C<'static, I2C0>>, Delay>,
     mut publisher: Publisher<'static, CriticalSectionRawMutex, Packet, 10, 2, 2>,
 ) {
-    let ticker = Ticker::every(Duration::from_secs(1));
+    let mut ticker = Ticker::every(Duration::from_secs(1));
 
     loop {
         let x = sensor.measure(Repeatability::High).unwrap();
@@ -88,8 +97,48 @@ async fn read_sensors(
 }
 
 #[embassy_executor::task]
-async fn report_sensors(mut subscriber: Subscriber<'static, CriticalSectionRawMutex, Packet, 10, 2, 2>) {
+async fn read_scd41(
+    mut sensor: Scd4x<&'static RefCellBus<I2C<'static, I2C0>>, Delay>,
+    mut publisher: Publisher<'static, CriticalSectionRawMutex, Packet, 10, 2, 2>,
+) {
+    let mut ticker = Ticker::every(Duration::from_secs(1));
+
     loop {
+        let x = sensor.measurement().unwrap();
+
+        let temp = x.temperature;
+        let humidity = x.humidity;
+        let co2 = x.co2 as f32;
+
+        let reading = Packet::new(vec![
+            SensorField {
+                sensor_name: proto::SensorName::Scd30.into(), // todo fix
+                r#type: Some(Type::Temperature(temp)),
+            },
+            SensorField {
+                sensor_name: proto::SensorName::Scd30.into(),
+                r#type: Some(Type::Humidity(humidity)),
+            },
+            SensorField {
+                sensor_name: proto::SensorName::Scd30.into(),
+                r#type: Some(Type::Co2(co2)),
+            },
+        ]);
+
+        publisher.publish(reading).await;
+        ticker.next().await;
+    }
+}
+
+#[embassy_executor::task]
+async fn report_sensors(mut subscriber: Subscriber<'static, CriticalSectionRawMutex, Packet, 10, 2, 2>) {
+
+    // async iterator over readings
+    // let readings = subscriber.flat_map(|p| p.sensor_fields);
+
+    loop {
+        // subscriber is a stream, you can use all the stream adaptors, if you want
+        // look at StreamExt for more, thi is an ASYNC ITERATOR
         let packet = match subscriber.next_message().await {
             WaitResult::Message(v) => v,
             _ => panic!(),
@@ -103,13 +152,14 @@ async fn report_sensors(mut subscriber: Subscriber<'static, CriticalSectionRawMu
 
         for field in &packet.sensor_fields {
             match field.r#type {
-                Some(Type::Temperature(t)) => println!("{} temp: {}", name, t),
-                Some(Type::Humidity(h)) => println!("{} humid: {}", name, h),
+                Some(Type::Temperature(t)) => println!("{} temp: {}", field.sensor_name, t),
+                Some(Type::Humidity(h)) => println!("{} humid: {}", field.sensor_name, h),
+                Some(Type::Co2(co2)) => println!("{} co2: {}", field.sensor_name, co2),
                 _ => panic!(),
-                None => panic!(),
             }
         }
 
+        // this allocates into our heap
         let mut buf = BytesMut::with_capacity(1024);
 
         packet.encode(&mut buf);
@@ -121,6 +171,7 @@ async fn report_sensors(mut subscriber: Subscriber<'static, CriticalSectionRawMu
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 static IO: StaticCell<IO> = StaticCell::new();
 static READINGS: PubSubChannel<CriticalSectionRawMutex, Packet, 10, 2, 2> = PubSubChannel::new();
+static I2C: StaticCell<RefCellBus<I2C<I2C0>>> = StaticCell::new();
 
 #[global_allocator]
 static HEAP: EspHeap = EspHeap::empty();
@@ -182,24 +233,18 @@ fn main() -> ! {
 
     // Create a new peripheral object with the described wiring
     // and standard I2C clock speed
-    let i2c = I2C::new(
+    let i2c: &_ = I2C.init(RefCellBus::new(I2C::new(
         peripherals.I2C0,
         sda,
         sck,
         200u32.kHz(),
         &mut system.peripheral_clock_control,
         &clocks,
-    );
+    )));
 
-    // let mut sensor = Veml7700::new(i2c);
-    // sensor.enable().unwrap();
+    let sht = sht3x::SHT3x::new(i2c, Delay::new(&clocks), sht3x::Address::Low);
 
-    let sensor = sht3x::SHT3x::new(i2c, Delay::new(&clocks), sht3x::Address::Low);
-
-    // let mut sensor = Hdc1080::new(i2c, Delay::new(&clocks)).unwrap();
-    // sensor.init().unwrap();
-
-    // esp_println::println!("reading! {:?}", sensor.read().unwrap());
+    let scd = scd4x::scd4x::Scd4x::new(i2c, Delay::new(&clocks));
 
     embassy::init(
         &clocks,
@@ -209,7 +254,10 @@ fn main() -> ! {
     let executor = EXECUTOR.init(Executor::new());
     executor.run(|spawner| {
         spawner
-            .spawn(read_sensors(sensor, READINGS.publisher().unwrap()))
+        .spawn(read_scd41(scd, READINGS.publisher().unwrap()))
+        .ok();
+        spawner
+            .spawn(read_sht3x(sht, READINGS.publisher().unwrap()))
             .ok();
         spawner
             .spawn(report_sensors(READINGS.subscriber().unwrap()))
